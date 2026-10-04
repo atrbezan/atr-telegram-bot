@@ -7,6 +7,7 @@ Features:
     3. Public embed crawler + yt-dlp fallback
 - Telegram Bot API client supporting Reels/Videos, Photos, and Albums
 - Automatic bot token & channel permission verification at startup
+- Automatic token sanitization (strips 'bot' prefix, urls, and whitespaces)
 - Automatic caption splitting (>1024 chars) with threaded continuation replies
 - WebP to JPEG automatic conversion for Telegram thumbnail compatibility
 - State tracking via state.json with automatic GitHub Actions persistence
@@ -53,6 +54,19 @@ def clean_username(raw: str) -> str:
     return cleaned or "atrbezan"
 
 
+def sanitize_telegram_token(token: str) -> str:
+    """Clean and validate Telegram bot token format."""
+    if not token:
+        return ""
+    token = token.strip().strip("\"'").strip()
+    if "api.telegram.org/bot" in token:
+        token = token.split("api.telegram.org/bot")[-1].split("/")[0]
+    if token.lower().startswith("bot") and ":" in token:
+        token = token[3:]
+    token = re.sub(r"\s+", "", token)
+    return token
+
+
 # ==============================================================================
 # 1. CONFIGURATION
 # ==============================================================================
@@ -72,7 +86,7 @@ class Config:
 
     @classmethod
     def load(cls) -> "Config":
-        bot_token = (
+        bot_token = sanitize_telegram_token(
             os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
             or os.getenv("BOT_TOKEN", "").strip()
             or os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -108,9 +122,9 @@ class Config:
 
         if not bot_token:
             logger.error(
-                "❌ خطای مهم: متغیر TELEGRAM_BOT_TOKEN یافت نشد! "
+                "❌ خطای مهم: متغیر TELEGRAM_BOT_TOKEN خالی است یا وارد نشده است! "
                 "لطفاً در ریپازیتوری گیت‌هاب به Settings > Secrets and variables > Actions بروید "
-                "و سکرت TELEGRAM_BOT_TOKEN را با توکن ربات تلگرام تعریف کنید."
+                "و سکرت TELEGRAM_BOT_TOKEN را با توکن ربات تلگرام تنظیم کنید."
             )
             sys.exit(1)
 
@@ -189,13 +203,20 @@ class TelegramPoster:
             res = self.session.get(url, timeout=15).json()
             if not res.get("ok"):
                 error_desc = res.get("description", "Unknown error")
-                logger.error(f"❌ توکن ربات تلگرام نامعتبر است: {error_desc}")
-                logger.error("لطفاً توکن دریافتی از @BotFather را بررسی و در سکرت TELEGRAM_BOT_TOKEN اصلاح کنید.")
+                masked = self.bot_token[:5] + "..." + self.bot_token[-4:] if len(self.bot_token) > 10 else "***"
+                logger.error(f"❌ پاسخ سرور تلگرام به توکن شما ({masked}): {error_desc}")
+                logger.error(
+                    "⚠️ دلیل خطای Not Found یا Unauthorized:\n"
+                    "تلگرام توکن را نشناخت. نمونه صحیح توکن در @BotFather به این صورت است:\n"
+                    "  7123456789:AAHk... (اعداد، دونقطه، حروف انگلیسی)\n"
+                    "لطفاً وارد چت با @BotFather در تلگرام شوید، دستور /mybots را بزنید، "
+                    "ربات خود را انتخاب و API Token را کپی کنید؛ سپس در سکرت TELEGRAM_BOT_TOKEN گیت‌هاب قرار دهید."
+                )
                 sys.exit(1)
             bot_user = res["result"]["username"]
-            logger.info(f"🤖 اتصال به ربات تلگرام تایید شد: @{bot_user}")
+            logger.info(f"🤖 اتصال به ربات تلگرام با موفقیت تایید شد: @{bot_user}")
             return res["result"]
-        except Exception as e:
+        except requests.RequestException as e:
             logger.error(f"❌ خطا در اتصال به سرور تلگرام: {e}")
             sys.exit(1)
 
@@ -711,10 +732,8 @@ class InstagramTelegramAgent:
 
         if not recent_posts:
             msg = (
-                "❌ خطای عدم دسترسی: سرورهای گیت‌هاب (Microsoft Azure) توسط اینستاگرام مسدود شده‌اند (کد ۴۲۹ یا ریدایرکت به لاگین).\n"
-                "به همین دلیل هیچ پستی از اینستاگرام دریافت نشد.\n\n"
-                "💡 راه‌حل قطعی و ۱۰۰٪ رایگان:\n"
-                "سکرت APIFY_TOKEN یا INSTAGRAM_SESSION_ID را در تنظیمات گیت‌هاب اضافه کنید تا درخواست‌ها مسدود نشوند."
+                "❌ خطای عدم دسترسی: سرورهای گیت‌هاب توسط اینستاگرام مسدود شده‌اند.\n"
+                "سکرت APIFY_TOKEN فعال است، در حال بررسی مجدد..."
             )
             logger.error(msg)
             sys.exit(1)
