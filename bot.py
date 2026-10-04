@@ -6,6 +6,7 @@ Features:
     2. Authenticated Instagram Session (INSTAGRAM_SESSION_ID)
     3. Public embed crawler + yt-dlp fallback
 - Telegram Bot API client supporting Reels/Videos, Photos, and Albums
+- Automatic bot token & channel permission verification at startup
 - Automatic caption splitting (>1024 chars) with threaded continuation replies
 - WebP to JPEG automatic conversion for Telegram thumbnail compatibility
 - State tracking via state.json with automatic GitHub Actions persistence
@@ -181,6 +182,40 @@ class TelegramPoster:
         self.chat_id = chat_id
         self.api_url = f"https://api.telegram.org/bot{self.bot_token}"
         self.session = requests.Session()
+
+    def verify_bot(self) -> dict:
+        url = f"{self.api_url}/getMe"
+        try:
+            res = self.session.get(url, timeout=15).json()
+            if not res.get("ok"):
+                error_desc = res.get("description", "Unknown error")
+                logger.error(f"❌ توکن ربات تلگرام نامعتبر است: {error_desc}")
+                logger.error("لطفاً توکن دریافتی از @BotFather را بررسی و در سکرت TELEGRAM_BOT_TOKEN اصلاح کنید.")
+                sys.exit(1)
+            bot_user = res["result"]["username"]
+            logger.info(f"🤖 اتصال به ربات تلگرام تایید شد: @{bot_user}")
+            return res["result"]
+        except Exception as e:
+            logger.error(f"❌ خطا در اتصال به سرور تلگرام: {e}")
+            sys.exit(1)
+
+    def verify_chat(self) -> dict:
+        url = f"{self.api_url}/getChat"
+        try:
+            res = self.session.post(url, data={"chat_id": self.chat_id}, timeout=15).json()
+            if not res.get("ok"):
+                error_desc = res.get("description", "Unknown error")
+                logger.error(f"❌ کانال {self.chat_id} در دسترس ربات نیست: {error_desc}")
+                logger.error(
+                    f"⚠️ راهنما: ربات تلگرام باید در کانال {self.chat_id} عضو شده و به عنوان Administrator (با مجوز ارسال پیام) اضافه شود."
+                )
+                sys.exit(1)
+            title = res["result"].get("title", self.chat_id)
+            logger.info(f"📢 دسترسی به کانال تلگرام تایید شد: {title} ({self.chat_id})")
+            return res["result"]
+        except Exception as e:
+            logger.error(f"❌ خطا در بررسی کانال تلگرام: {e}")
+            sys.exit(1)
 
     def _request(self, method: str, data: Optional[dict] = None, files: Optional[dict] = None) -> dict:
         url = f"{self.api_url}/{method}"
@@ -630,6 +665,10 @@ class InstagramTelegramAgent:
         self.config = config
         self.state = StateManager(config.state_file_path)
         self.tg = TelegramPoster(config.telegram_bot_token, config.telegram_chat_id)
+        # Perform self-checks
+        self.tg.verify_bot()
+        self.tg.verify_chat()
+
         self.ig = InstagramDownloader(
             config.instagram_username,
             config.download_dir,
@@ -695,6 +734,7 @@ class InstagramTelegramAgent:
             key=lambda p: p.date_utc if isinstance(p, instaloader.Post) else p.get("date_utc", datetime.now(timezone.utc))
         )
 
+        errors = []
         for post in new_posts:
             sc = post.shortcode if isinstance(post, instaloader.Post) else post["shortcode"]
             try:
@@ -705,7 +745,13 @@ class InstagramTelegramAgent:
                 logger.info(f"✨ پست {sc} با موفقیت به تلگرام ارسال و ثبت شد.")
                 time.sleep(3)
             except Exception as e:
-                logger.error(f"❌ خطا در پردازش یا ارسال پست {sc}: {e}")
+                err_msg = f"پست {sc}: {e}"
+                logger.error(f"❌ خطا در پردازش یا ارسال {err_msg}")
+                errors.append(err_msg)
+
+        if errors and len(errors) == len(new_posts):
+            logger.error("❌ هیچ‌کدام از پست‌های جدید با موفقیت به تلگرام ارسال نشدند!")
+            sys.exit(1)
 
     def run_daemon(self):
         logger.info(f"ربات در حال کار است. بررسی هر {self.config.check_interval_seconds} ثانیه...")
