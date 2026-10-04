@@ -5,11 +5,12 @@ Features:
     1. Apify API (Residential Proxies - 100% bypass of datacenter 429 blocks)
     2. Authenticated Instagram Session (INSTAGRAM_SESSION_ID)
     3. Public embed crawler + yt-dlp fallback
-- Telegram Bot API client supporting Reels/Videos, Photos, and Albums
+- Telegram Bot API client supporting Reels/Videos, Photos, and Multi-slide Albums (Carousels)
+- Automatic chunking of albums (>10 slides) into balanced parts compliant with Telegram API
 - Automatic bot token & channel permission verification at startup
 - Automatic token sanitization (strips 'bot' prefix, urls, and whitespaces)
+- Automatic WebP/PNG to JPEG conversion for native Telegram photo album rendering
 - Automatic caption splitting (>1024 chars) with threaded continuation replies
-- WebP to JPEG automatic conversion for Telegram thumbnail compatibility
 - State tracking via state.json with automatic GitHub Actions persistence
 """
 
@@ -65,6 +66,39 @@ def sanitize_telegram_token(token: str) -> str:
         token = token[3:]
     token = re.sub(r"\s+", "", token)
     return token
+
+
+def chunk_media_list(items: list, max_size: int = 10) -> List[list]:
+    """
+    Split a list of media items into chunks where each chunk has between 2 and 10 items.
+    Telegram sendMediaGroup requires at least 2 and at most 10 items per group.
+    """
+    n = len(items)
+    if n <= max_size:
+        return [items]
+
+    chunks = []
+    i = 0
+    while i < n:
+        remaining = n - i
+        if remaining <= max_size:
+            if remaining == 1 and chunks:
+                # Borrow one item from previous chunk so both chunks have >= 2 items
+                last = chunks.pop()
+                chunks.append(last[:-1])
+                chunks.append([last[-1], items[i]])
+            else:
+                chunks.append(items[i : i + remaining])
+            break
+        elif remaining == max_size + 1:
+            # E.g. 11 items remaining -> split into 6 and 5 instead of 10 and 1
+            half = remaining // 2
+            chunks.append(items[i : i + half + 1])
+            i += half + 1
+        else:
+            chunks.append(items[i : i + max_size])
+            i += max_size
+    return chunks
 
 
 # ==============================================================================
@@ -205,13 +239,6 @@ class TelegramPoster:
                 error_desc = res.get("description", "Unknown error")
                 masked = self.bot_token[:5] + "..." + self.bot_token[-4:] if len(self.bot_token) > 10 else "***"
                 logger.error(f"❌ پاسخ سرور تلگرام به توکن شما ({masked}): {error_desc}")
-                logger.error(
-                    "⚠️ دلیل خطای Not Found یا Unauthorized:\n"
-                    "تلگرام توکن را نشناخت. نمونه صحیح توکن در @BotFather به این صورت است:\n"
-                    "  7123456789:AAHk... (اعداد، دونقطه، حروف انگلیسی)\n"
-                    "لطفاً وارد چت با @BotFather در تلگرام شوید، دستور /mybots را بزنید، "
-                    "ربات خود را انتخاب و API Token را کپی کنید؛ سپس در سکرت TELEGRAM_BOT_TOKEN گیت‌هاب قرار دهید."
-                )
                 sys.exit(1)
             bot_user = res["result"]["username"]
             logger.info(f"🤖 اتصال به ربات تلگرام با موفقیت تایید شد: @{bot_user}")
@@ -248,11 +275,6 @@ class TelegramPoster:
                     error_desc = res_data.get("description", "Unknown error")
                     error_code = res_data.get("error_code")
                     logger.error(f"Telegram API Error [{error_code}]: {error_desc}")
-
-                    if error_code == 401:
-                        logger.error("❌ توکن ربات تلگرام نامعتبر است! توکن دریافتی از @BotFather را چک کنید.")
-                    elif error_code == 400 and ("chat not found" in error_desc.lower() or "not enough rights" in error_desc.lower()):
-                        logger.error(f"❌ کانال {self.chat_id} پیدا نشد یا ربات ادمین نیست! مطمئن شوید ربات در کانال ادمین با مجوز ارسال پیام است.")
 
                     if error_code == 429:
                         wait_sec = res_data.get("parameters", {}).get("retry_after", 10)
@@ -323,16 +345,18 @@ class TelegramPoster:
 
     def send_media_group(self, media_files: List[dict], caption: str = "") -> list[dict]:
         short_caption, extra_text = self.split_caption(caption)
+        chunks = chunk_media_list(media_files, max_size=10)
         results = []
-        chunks = [media_files[i : i + 10] for i in range(0, len(media_files), 10)]
+        total_parts = len(chunks)
 
         for chunk_idx, chunk in enumerate(chunks):
+            part_num = chunk_idx + 1
             media_array = []
             files = {}
             handlers = []
             try:
                 for idx, item in enumerate(chunk):
-                    file_key = f"file_{idx}"
+                    file_key = f"file_{chunk_idx}_{idx}"
                     file_path = item["path"]
                     fh = open(file_path, "rb")
                     handlers.append(fh)
@@ -341,12 +365,20 @@ class TelegramPoster:
                     files[file_key] = (os.path.basename(file_path), fh, mime)
 
                     obj = {"type": mtype, "media": f"attach://{file_key}"}
-                    if chunk_idx == 0 and idx == 0 and short_caption:
-                        obj["caption"] = short_caption
+
+                    # Attach caption:
+                    if chunk_idx == 0 and idx == 0:
+                        cap = short_caption
+                        if total_parts > 1:
+                            cap = f"{cap}\n\n(📸 بخش ۱ از {total_parts})".strip()
+                        obj["caption"] = cap
+                    elif chunk_idx > 0 and idx == 0:
+                        obj["caption"] = f"📸 ادامه آلبوم (بخش {part_num} از {total_parts})"
+
                     if mtype == "video":
                         obj["supports_streaming"] = True
                         if item.get("thumb") and os.path.exists(item["thumb"]):
-                            tkey = f"thumb_{idx}"
+                            tkey = f"thumb_{chunk_idx}_{idx}"
                             tfh = open(item["thumb"], "rb")
                             handlers.append(tfh)
                             files[tkey] = (os.path.basename(item["thumb"]), tfh, "image/jpeg")
@@ -355,17 +387,19 @@ class TelegramPoster:
                     media_array.append(obj)
 
                 data = {"chat_id": self.chat_id, "media": json.dumps(media_array)}
+                logger.info(f"📤 ارسال آلبوم به تلگرام (بخش {part_num} از {total_parts} شامل {len(chunk)} اسلاید)...")
                 res = self._request("sendMediaGroup", data=data, files=files)
                 results.append(res)
             finally:
                 for h in handlers:
                     h.close()
-            if chunk_idx < len(chunks) - 1:
-                time.sleep(1.5)
+
+            if chunk_idx < total_parts - 1:
+                time.sleep(2.5)
 
         if extra_text and results:
-            msg_id = results[0].get("result", [{}])[0].get("message_id")
-            self.send_message(f"ادامه کپشن:\n\n{extra_text}", reply_to_message_id=msg_id)
+            first_msg_id = results[0].get("result", [{}])[0].get("message_id")
+            self.send_message(f"ادامه کپشن:\n\n{extra_text}", reply_to_message_id=first_msg_id)
 
         return results
 
@@ -431,8 +465,64 @@ class InstagramDownloader:
             except Exception as e:
                 logger.warning(f"خطا در اعمال کوکی sessionid: {e}")
 
+    def _download_file(self, url: str, dest_path: str) -> bool:
+        """Download file directly from CDN with streaming and retry."""
+        if not url:
+            return False
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        for attempt in range(1, 3):
+            try:
+                res = requests.get(url, headers=headers, stream=True, timeout=35)
+                if res.status_code == 200:
+                    with open(dest_path, "wb") as f:
+                        for chunk in res.iter_content(chunk_size=65536):
+                            if chunk:
+                                f.write(chunk)
+                    return True
+                else:
+                    logger.warning(f"دانلود ناموفق از CDN ({res.status_code}): {url[:70]}")
+            except Exception as e:
+                logger.warning(f"خطا در دانلود فایل (تلاش {attempt}/2): {e}")
+                time.sleep(1)
+        return False
+
+    def _ensure_jpeg_image(self, file_path: Optional[str]) -> Optional[str]:
+        """Convert any image (WebP, PNG, etc.) to clean JPEG for Telegram album compatibility."""
+        if not file_path or not os.path.exists(file_path):
+            return None
+        target_jpg = os.path.splitext(file_path)[0] + ".jpg"
+        if not HAS_PIL:
+            if not file_path.lower().endswith(".jpg"):
+                try:
+                    os.rename(file_path, target_jpg)
+                    return target_jpg
+                except Exception:
+                    pass
+            return file_path
+        try:
+            with Image.open(file_path) as img:
+                if img.mode in ("RGBA", "LA", "P"):
+                    rgb_img = Image.new("RGB", img.size, (255, 255, 255))
+                    if img.mode == "P":
+                        img = img.convert("RGBA")
+                    rgb_img.paste(img, mask=img.split()[-1] if "A" in img.mode else None)
+                    rgb_img.save(target_jpg, "JPEG", quality=95, optimize=True)
+                else:
+                    img.convert("RGB").save(target_jpg, "JPEG", quality=95, optimize=True)
+            if target_jpg != file_path and os.path.exists(target_jpg):
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
+            return target_jpg
+        except Exception as e:
+            logger.warning(f"خطا در تبدیل تصویر به JPEG ({file_path}): {e}")
+            return file_path
+
     def _fetch_from_apify(self, limit: int = 5) -> List[dict]:
-        """Fetch posts via Apify Instagram Scraper (Residential proxies)."""
+        """Fetch posts via Apify Instagram Scraper with full carousel slide support."""
         if not self.apify_token:
             return []
         logger.info(f"🌐 در حال دریافت پست‌ها از طریق Apify برای پیج {self.target_username}...")
@@ -445,7 +535,7 @@ class InstagramDownloader:
         }
         try:
             res = requests.post(url, params=params, json=payload, timeout=90)
-            if res.status_code == 200 or res.status_code == 201:
+            if res.status_code in (200, 201):
                 items = res.json()
                 logger.info(f"✅ تعداد {len(items)} آیتم از Apify دریافت شد.")
                 posts = []
@@ -455,17 +545,53 @@ class InstagramDownloader:
                         m = re.search(r'/(?:p|reel)/([A-Za-z0-9_-]+)', item["url"])
                         if m:
                             sc = m.group(1)
-                    if sc:
-                        posts.append({
-                            "shortcode": sc,
-                            "url": item.get("url") or f"https://www.instagram.com/reel/{sc}/",
-                            "is_video": item.get("isVideo", True),
-                            "typename": "GraphVideo" if item.get("isVideo", True) else "GraphImage",
-                            "caption": item.get("caption") or "",
-                            "date_utc": datetime.fromisoformat(item["timestamp"].replace("Z", "+00:00")) if item.get("timestamp") else datetime.now(timezone.utc),
+                    if not sc:
+                        continue
+
+                    post_type = item.get("type", "")
+                    child_posts = item.get("childPosts") or []
+                    images_list = item.get("images") or []
+                    is_sidecar = (
+                        post_type == "Sidecar"
+                        or item.get("productType") == "carousel_container"
+                        or len(child_posts) > 1
+                        or (isinstance(images_list, list) and len(images_list) > 1)
+                    )
+
+                    slides = []
+                    if child_posts:
+                        for cp in child_posts:
+                            c_is_vid = cp.get("isVideo", False) or (cp.get("type") == "Video") or bool(cp.get("videoUrl"))
+                            slides.append({
+                                "is_video": c_is_vid,
+                                "display_url": cp.get("displayUrl") or cp.get("imageUrl"),
+                                "video_url": cp.get("videoUrl"),
+                            })
+                    elif isinstance(images_list, list) and len(images_list) > 1:
+                        for img_u in images_list:
+                            slides.append({
+                                "is_video": False,
+                                "display_url": img_u,
+                                "video_url": None,
+                            })
+
+                    is_single_vid = item.get("isVideo", False) or post_type == "Video" or bool(item.get("videoUrl"))
+                    if not slides:
+                        slides.append({
+                            "is_video": is_single_vid,
+                            "display_url": item.get("displayUrl") or (images_list[0] if isinstance(images_list, list) and images_list else None),
                             "video_url": item.get("videoUrl"),
-                            "display_url": item.get("displayUrl"),
                         })
+
+                    posts.append({
+                        "shortcode": sc,
+                        "url": item.get("url") or f"https://www.instagram.com/p/{sc}/",
+                        "is_video": is_single_vid and not is_sidecar,
+                        "typename": "GraphSidecar" if is_sidecar else ("GraphVideo" if is_single_vid else "GraphImage"),
+                        "caption": item.get("caption") or "",
+                        "date_utc": datetime.fromisoformat(item["timestamp"].replace("Z", "+00:00")) if item.get("timestamp") else datetime.now(timezone.utc),
+                        "slides": slides,
+                    })
                 return posts
             else:
                 logger.warning(f"خطای پاسخ Apify: {res.status_code} - {res.text[:200]}")
@@ -473,15 +599,58 @@ class InstagramDownloader:
             logger.warning(f"خطا در اتصال به Apify: {e}")
         return []
 
+    def _fetch_embed_post_details(self, shortcode: str) -> Optional[dict]:
+        """Fetch post details & carousel slides via public embed page."""
+        url = f"https://www.instagram.com/p/{shortcode}/embed/"
+        for ua in ["curl/7.88.1", "TelegramBot", None]:
+            headers = {"User-Agent": ua} if ua else {}
+            try:
+                res = requests.get(url, headers=headers, timeout=12)
+                if res.status_code == 200:
+                    pattern = r'edge_sidecar_to_children\\":\{.*?\\"edges\\":\[(.*?)\]\}'
+                    m = re.search(pattern, res.text)
+                    slides = []
+                    if m:
+                        edges_str = m.group(1)
+                        urls = re.findall(r'display_url\\":\\"(http[s]?:[^\"]+?)\\"', edges_str)
+                        for u in urls:
+                            cleaned = u.replace(r'\\\/', '/').replace(r'\/', '/')
+                            slides.append({"is_video": False, "display_url": cleaned, "video_url": None})
+                    else:
+                        u_m = re.search(r'display_url\\":\\"(http[s]?:[^\"]+?)\\"', res.text)
+                        if u_m:
+                            cleaned = u_m.group(1).replace(r'\\\/', '/').replace(r'\/', '/')
+                            slides.append({"is_video": False, "display_url": cleaned, "video_url": None})
+
+                    cap_m = re.search(r'caption\\":\\"(.*?)\\"', res.text)
+                    caption = cap_m.group(1) if cap_m else ""
+                    try:
+                        caption = caption.encode().decode("unicode-escape")
+                    except Exception:
+                        pass
+
+                    is_sidecar = len(slides) > 1
+                    return {
+                        "shortcode": shortcode,
+                        "url": f"https://www.instagram.com/p/{shortcode}/",
+                        "is_video": False,
+                        "typename": "GraphSidecar" if is_sidecar else "GraphImage",
+                        "caption": caption,
+                        "date_utc": datetime.now(timezone.utc),
+                        "slides": slides,
+                    }
+            except Exception:
+                pass
+        return None
+
     def _fetch_shortcodes(self) -> List[str]:
-        """Fetch shortcodes via public embed interface with multiple fallback user-agents."""
+        """Fetch shortcodes via public embed profile interface."""
         url = f"https://www.instagram.com/{self.target_username}/embed/"
         user_agents = [
-            None,
             "curl/7.88.1",
             "TelegramBot (like TwitterBot)",
             "facebookexternalhit/1.1 (+https://www.facebook.com/externalhit_uatext.php)",
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1",
+            None,
         ]
 
         cookies = {}
@@ -507,19 +676,6 @@ class InstagramDownloader:
 
         return []
 
-    def _get_ytdlp_metadata(self, shortcode: str) -> Optional[dict]:
-        """Fetch post/reel metadata using yt-dlp."""
-        for u_type in ["reel", "p"]:
-            url = f"https://www.instagram.com/{u_type}/{shortcode}/"
-            cmd = ["yt-dlp", "--dump-json", "--no-warnings", url]
-            try:
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
-                if res.returncode == 0 and res.stdout.strip():
-                    return json.loads(res.stdout.strip())
-            except Exception:
-                pass
-        return None
-
     def get_latest_posts(self, limit: int = 5) -> List[Union[instaloader.Post, dict]]:
         # 1. Try Apify if configured
         if self.apify_token:
@@ -540,18 +696,10 @@ class InstagramDownloader:
                 except Exception:
                     pass
 
-                meta = self._get_ytdlp_metadata(sc)
-                if meta:
-                    posts.append(
-                        {
-                            "shortcode": sc,
-                            "url": f"https://www.instagram.com/reel/{sc}/",
-                            "is_video": True,
-                            "typename": "GraphVideo",
-                            "caption": meta.get("description") or "",
-                            "date_utc": datetime.fromtimestamp(meta.get("timestamp", time.time()), tz=timezone.utc),
-                        }
-                    )
+                details = self._fetch_embed_post_details(sc)
+                if details:
+                    posts.append(details)
+                    continue
 
             if posts:
                 return posts
@@ -569,22 +717,6 @@ class InstagramDownloader:
 
         return posts
 
-    def _ensure_jpeg_thumbnail(self, thumb_path: Optional[str]) -> Optional[str]:
-        if not thumb_path or not os.path.exists(thumb_path):
-            return None
-        ext = os.path.splitext(thumb_path)[1].lower()
-        if ext in [".jpg", ".jpeg"]:
-            return thumb_path
-        if not HAS_PIL:
-            return thumb_path
-        try:
-            target_jpg = os.path.splitext(thumb_path)[0] + ".jpg"
-            with Image.open(thumb_path) as img:
-                img.convert("RGB").save(target_jpg, "JPEG", quality=90)
-            return target_jpg
-        except Exception:
-            return thumb_path
-
     def download_post(self, post_item: Union[instaloader.Post, dict]) -> InstagramPostItem:
         if isinstance(post_item, instaloader.Post):
             sc = post_item.shortcode
@@ -593,47 +725,85 @@ class InstagramDownloader:
             caption = post_item.caption or ""
             date_utc = post_item.date_utc
             url = f"https://www.instagram.com/p/{sc}/"
+            slides_manifest = []
+            if typename == "GraphSidecar":
+                try:
+                    for node in post_item.get_sidecar_nodes():
+                        slides_manifest.append({
+                            "is_video": node.is_video,
+                            "display_url": node.display_url,
+                            "video_url": node.video_url if node.is_video else None,
+                        })
+                except Exception:
+                    pass
         else:
             sc = post_item["shortcode"]
             is_video = post_item.get("is_video", True)
             typename = post_item.get("typename", "GraphVideo")
             caption = post_item.get("caption", "")
             date_utc = post_item.get("date_utc", datetime.now(timezone.utc))
-            url = post_item.get("url", f"https://www.instagram.com/reel/{sc}/")
+            url = post_item.get("url", f"https://www.instagram.com/p/{sc}/")
+            slides_manifest = post_item.get("slides", [])
 
         post_dir = self.download_dir / sc
         if post_dir.exists():
             shutil.rmtree(post_dir, ignore_errors=True)
         post_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"📥 شروع دانلود رسانه {sc} ({typename})...")
+        logger.info(f"📥 شروع دانلود رسانه {sc} ({typename} - {len(slides_manifest)} آیتم)...")
+        media_items = []
 
-        if isinstance(post_item, instaloader.Post):
-            try:
-                self.loader.download_post(post_item, target=sc)
-            except Exception:
-                pass
+        # 1. Download directly from CDN manifests (Fastest & high quality)
+        if slides_manifest:
+            for idx, slide in enumerate(slides_manifest):
+                s_is_vid = slide.get("is_video", False)
+                disp_url = slide.get("display_url")
+                vid_url = slide.get("video_url")
 
-        videos = sorted(glob.glob(str(post_dir / "*.mp4")))
-        images = sorted(
-            glob.glob(str(post_dir / "*.jpg"))
-            + glob.glob(str(post_dir / "*.png"))
-            + glob.glob(str(post_dir / "*.webp"))
-        )
+                if s_is_vid:
+                    v_path = str(post_dir / f"slide_{idx:02d}.mp4")
+                    t_path = str(post_dir / f"slide_{idx:02d}.jpg") if disp_url else None
+                    v_downloaded = False
+                    if vid_url:
+                        v_downloaded = self._download_file(vid_url, v_path)
+                    if not v_downloaded:
+                        # Fallback to yt-dlp
+                        out_tmpl = str(post_dir / f"slide_{idx:02d}.%(ext)s")
+                        cmd = [
+                            "yt-dlp",
+                            "--no-warnings",
+                            "-o",
+                            out_tmpl,
+                            f"https://www.instagram.com/reel/{sc}/",
+                        ]
+                        subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+                        v_files = sorted(glob.glob(str(post_dir / f"slide_{idx:02d}*.mp4")))
+                        if v_files:
+                            v_path = v_files[0]
+                            v_downloaded = True
 
-        # Fallback to yt-dlp if video is missing
-        if is_video and not videos:
-            logger.info(f"دانلود ویدیو با yt-dlp برای {sc}...")
-            out_tmpl = str(post_dir / f"{sc}.%(ext)s")
-            cmd = [
-                "yt-dlp",
-                "--no-warnings",
-                "--write-thumbnail",
-                "-o",
-                out_tmpl,
-                f"https://www.instagram.com/reel/{sc}/",
-            ]
-            subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+                    if v_downloaded:
+                        thumb = None
+                        if disp_url:
+                            if self._download_file(disp_url, t_path):
+                                thumb = self._ensure_jpeg_image(t_path)
+                        media_items.append({"type": "video", "path": v_path, "thumb": thumb})
+                else:
+                    # Photo slide
+                    img_raw = str(post_dir / f"slide_{idx:02d}.raw")
+                    if disp_url and self._download_file(disp_url, img_raw):
+                        jpg_path = self._ensure_jpeg_image(img_raw)
+                        if jpg_path and os.path.exists(jpg_path):
+                            media_items.append({"type": "photo", "path": jpg_path, "thumb": None})
+
+        # 2. Fallback to Instaloader or yt-dlp if direct download was empty
+        if not media_items:
+            if isinstance(post_item, instaloader.Post):
+                try:
+                    self.loader.download_post(post_item, target=sc)
+                except Exception:
+                    pass
+
             videos = sorted(glob.glob(str(post_dir / "*.mp4")))
             images = sorted(
                 glob.glob(str(post_dir / "*.jpg"))
@@ -641,26 +811,41 @@ class InstagramDownloader:
                 + glob.glob(str(post_dir / "*.webp"))
             )
 
-        media_items = []
-        if is_video and typename != "GraphSidecar":
-            if videos:
-                raw_thumb = images[0] if images else None
-                thumb = self._ensure_jpeg_thumbnail(raw_thumb)
+            if is_video and not videos:
+                logger.info(f"دانلود ویدیو با yt-dlp برای {sc}...")
+                out_tmpl = str(post_dir / f"{sc}.%(ext)s")
+                cmd = [
+                    "yt-dlp",
+                    "--no-warnings",
+                    "--write-thumbnail",
+                    "-o",
+                    out_tmpl,
+                    f"https://www.instagram.com/reel/{sc}/",
+                ]
+                subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+                videos = sorted(glob.glob(str(post_dir / "*.mp4")))
+                images = sorted(
+                    glob.glob(str(post_dir / "*.jpg"))
+                    + glob.glob(str(post_dir / "*.png"))
+                    + glob.glob(str(post_dir / "*.webp"))
+                )
+
+            if typename == "GraphSidecar" or len(images) > 1 or len(videos) > 1:
+                video_bases = {os.path.splitext(v)[0] for v in videos}
+                for v in videos:
+                    base = os.path.splitext(v)[0]
+                    t = (base + ".jpg") if os.path.exists(base + ".jpg") else None
+                    media_items.append({"type": "video", "path": v, "thumb": self._ensure_jpeg_image(t)})
+                for img in images:
+                    base = os.path.splitext(img)[0]
+                    if base not in video_bases:
+                        media_items.append({"type": "photo", "path": self._ensure_jpeg_image(img), "thumb": None})
+                media_items.sort(key=lambda x: x["path"])
+            elif is_video and videos:
+                thumb = self._ensure_jpeg_image(images[0]) if images else None
                 media_items.append({"type": "video", "path": videos[0], "thumb": thumb})
-        elif typename == "GraphSidecar":
-            video_bases = {os.path.splitext(v)[0] for v in videos}
-            for v in videos:
-                base = os.path.splitext(v)[0]
-                t = (base + ".jpg") if os.path.exists(base + ".jpg") else None
-                media_items.append({"type": "video", "path": v, "thumb": self._ensure_jpeg_thumbnail(t)})
-            for img in images:
-                base = os.path.splitext(img)[0]
-                if base not in video_bases:
-                    media_items.append({"type": "photo", "path": img, "thumb": None})
-            media_items.sort(key=lambda x: x["path"])
-        else:
-            if images:
-                media_items.append({"type": "photo", "path": images[0], "thumb": None})
+            elif images:
+                media_items.append({"type": "photo", "path": self._ensure_jpeg_image(images[0]), "thumb": None})
 
         return InstagramPostItem(
             shortcode=sc,
@@ -722,7 +907,7 @@ class InstagramTelegramAgent:
                 logger.info(f"📤 ارسال تصویر {item.shortcode} به تلگرام...")
                 self.tg.send_photo(media["path"], caption=caption)
         else:
-            logger.info(f"📤 ارسال آلبوم چند رسانه‌ای ({len(files)} آیتم) {item.shortcode} به تلگرام...")
+            logger.info(f"📤 ارسال آلبوم چند رسانه‌ای ({len(files)} اسلاید) {item.shortcode} به تلگرام...")
             self.tg.send_media_group(files, caption=caption)
 
     def check_and_sync(self):
