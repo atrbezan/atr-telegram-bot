@@ -1,0 +1,6 @@
+instaloader>=4.10.0
+yt-dlp>=2024.08.06
+requests>=2.31.0
+python-dotenv>=1.0.0
+urllib3>=2.0.0
+Pillow>=10.0.0
