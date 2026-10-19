@@ -10,7 +10,7 @@ Features:
 - Automatic bot token & channel permission verification at startup
 - Automatic token sanitization (strips 'bot' prefix, urls, and whitespaces)
 - Automatic WebP/PNG to JPEG conversion for native Telegram photo album rendering
-- Automatic caption splitting (>1024 chars) with threaded continuation replies
+- Strict caption splitting (<1024 chars hard limit) with threaded continuation replies
 - State tracking via state.json with automatic GitHub Actions persistence
 """
 
@@ -83,7 +83,6 @@ def chunk_media_list(items: list, max_size: int = 10) -> List[list]:
         remaining = n - i
         if remaining <= max_size:
             if remaining == 1 and chunks:
-                # Borrow one item from previous chunk so both chunks have >= 2 items
                 last = chunks.pop()
                 chunks.append(last[:-1])
                 chunks.append([last[-1], items[i]])
@@ -91,7 +90,6 @@ def chunk_media_list(items: list, max_size: int = 10) -> List[list]:
                 chunks.append(items[i : i + remaining])
             break
         elif remaining == max_size + 1:
-            # E.g. 11 items remaining -> split into 6 and 5 instead of 10 and 1
             half = remaining // 2
             chunks.append(items[i : i + half + 1])
             i += half + 1
@@ -169,7 +167,7 @@ class Config:
 
         logger.info(f"✅ تنظیمات بارگذاری شد: پیج={ig_username} | کانال={chat_id}")
         if apify_token:
-            logger.info("🚀 استفاده از سرویس Apify برای دور زدن ۱۰۰٪ بلاک دیتاسنتر فعال است.")
+            logger.info("🚀 استفاده از Apify برای دور زدن ۱۰۰٪ بلاک دیتاسنتر فعال است.")
         elif session_id:
             logger.info("🔑 نشست کوکی اینستاگرام (INSTAGRAM_SESSION_ID) فعال است.")
         else:
@@ -289,19 +287,32 @@ class TelegramPoster:
                 time.sleep(2 * attempt)
         raise RuntimeError(f"ارسال به تلگرام در متد {method} پس از ۳ تلاش با شکست مواجه شد.")
 
-    def split_caption(self, caption: str) -> tuple[str, Optional[str]]:
+    def split_caption(self, caption: str, max_cap: int = 950) -> tuple[str, Optional[str]]:
         if not caption:
             return "", None
         caption = caption.strip()
-        if len(caption) <= 1024:
+        if len(caption) <= max_cap:
             return caption, None
 
-        cut_idx = 1000
-        last_nl = caption[:cut_idx].rfind("\n")
-        if last_nl > 700:
+        suffix = "\n\n...(ادامه کپشن در پیام بعد ⬇️)"
+        target_len = max_cap - len(suffix)
+
+        cut_idx = target_len
+        last_nl = caption[:target_len].rfind("\n")
+        if last_nl > 450:
             cut_idx = last_nl
-        short_cap = caption[:cut_idx].strip() + "\n\n...(ادامه کپشن در پیام بعد ⬇️)"
+        else:
+            last_space = caption[:target_len].rfind(" ")
+            if last_space > 450:
+                cut_idx = last_space
+
+        short_cap = caption[:cut_idx].strip() + suffix
         extra = caption[cut_idx:].strip()
+
+        # Hard clamp: under NO circumstance can caption exceed 1020 characters in Telegram
+        if len(short_cap) > 1020:
+            short_cap = short_cap[:1020]
+
         return short_cap, extra
 
     def send_message(self, text: str, reply_to_message_id: Optional[int] = None) -> dict:
@@ -311,7 +322,9 @@ class TelegramPoster:
         return self._request("sendMessage", data=data)
 
     def send_photo(self, photo_path: str, caption: str = "") -> dict:
-        short_caption, extra_text = self.split_caption(caption)
+        short_caption, extra_text = self.split_caption(caption, max_cap=950)
+        if len(short_caption) > 1020:
+            short_caption = short_caption[:1020]
         data = {"chat_id": self.chat_id, "caption": short_caption}
         with open(photo_path, "rb") as f:
             files = {"photo": (os.path.basename(photo_path), f, "image/jpeg")}
@@ -322,7 +335,9 @@ class TelegramPoster:
         return res
 
     def send_video(self, video_path: str, caption: str = "", thumb_path: Optional[str] = None) -> dict:
-        short_caption, extra_text = self.split_caption(caption)
+        short_caption, extra_text = self.split_caption(caption, max_cap=950)
+        if len(short_caption) > 1020:
+            short_caption = short_caption[:1020]
         data = {"chat_id": self.chat_id, "caption": short_caption, "supports_streaming": True}
         files = {}
         handlers = []
@@ -344,10 +359,12 @@ class TelegramPoster:
         return res
 
     def send_media_group(self, media_files: List[dict], caption: str = "") -> list[dict]:
-        short_caption, extra_text = self.split_caption(caption)
         chunks = chunk_media_list(media_files, max_size=10)
         results = []
         total_parts = len(chunks)
+
+        max_cap = 900 if total_parts > 1 else 950
+        short_caption, extra_text = self.split_caption(caption, max_cap=max_cap)
 
         for chunk_idx, chunk in enumerate(chunks):
             part_num = chunk_idx + 1
@@ -371,6 +388,8 @@ class TelegramPoster:
                         cap = short_caption
                         if total_parts > 1:
                             cap = f"{cap}\n\n(📸 بخش ۱ از {total_parts})".strip()
+                        if len(cap) > 1020:
+                            cap = cap[:1020]
                         obj["caption"] = cap
                     elif chunk_idx > 0 and idx == 0:
                         obj["caption"] = f"📸 ادامه آلبوم (بخش {part_num} از {total_parts})"
@@ -767,7 +786,6 @@ class InstagramDownloader:
                     if vid_url:
                         v_downloaded = self._download_file(vid_url, v_path)
                     if not v_downloaded:
-                        # Fallback to yt-dlp
                         out_tmpl = str(post_dir / f"slide_{idx:02d}.%(ext)s")
                         cmd = [
                             "yt-dlp",
@@ -789,7 +807,6 @@ class InstagramDownloader:
                                 thumb = self._ensure_jpeg_image(t_path)
                         media_items.append({"type": "video", "path": v_path, "thumb": thumb})
                 else:
-                    # Photo slide
                     img_raw = str(post_dir / f"slide_{idx:02d}.raw")
                     if disp_url and self._download_file(disp_url, img_raw):
                         jpg_path = self._ensure_jpeg_image(img_raw)
@@ -985,4 +1002,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
